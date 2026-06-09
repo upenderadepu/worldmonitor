@@ -180,6 +180,25 @@ describe('chokepoint methodology docs match scoring code', () => {
       assert.match(text, /top1 \* 0\.5 \+ top2 \* 0\.3 \+ top3 \* 0\.2/, `${label} must document the vulnerability formula`);
     }
   });
+
+  it('documents flow-estimate source and hazard fields on contract surfaces', () => {
+    for (const [label, text] of [
+      ['supply-chain proto', supplyChainProto],
+      ['SupplyChainService OpenAPI', supplyChainOpenApi],
+      ['bundled OpenAPI', bundledOpenApi],
+    ]) {
+      const flowEstimateContract = label === 'supply-chain proto'
+        ? extractProtoMessage(text, 'FlowEstimate')
+        : extractYamlSchema(text, label === 'bundled OpenAPI' ? 'worldmonitor_supply_chain_v1_FlowEstimate' : 'FlowEstimate');
+      assert.match(flowEstimateContract, /portwatch-dwt/i, `${label} must document the DWT-backed flow source`);
+      assert.match(flowEstimateContract, /portwatch-counts/i, `${label} must document the count-backed flow source`);
+      assert.match(flowEstimateContract, /GDACS/i, `${label} must document GDACS hazard enrichment`);
+      assert.match(flowEstimateContract, /configured radius/i, `${label} must document the hazard matching radius`);
+      assert.match(flowEstimateContract, /"RED"/, `${label} must document RED hazard alerts`);
+      assert.match(flowEstimateContract, /"ORANGE"/, `${label} must document ORANGE hazard alerts`);
+      assert.match(flowEstimateContract, /empty string/i, `${label} must document the absent-hazard wire value`);
+    }
+  });
 });
 
 describe('scenario docs match worker scope and impact math', () => {
