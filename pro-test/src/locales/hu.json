@@ -374,7 +374,7 @@
           "Napi piaci briefek",
           "Katonai és geopolitikai követés",
           "Custom widget builder",
-          "MCP adatcsatlakozók",
+          "MCP-hozzáférés Claude Desktophoz és más AI-kliensekhez (50 hívás/nap)",
           "Prioritásos adatfrissítés"
         ]
       },
@@ -383,7 +383,8 @@
         "features": [
           "REST API-hozzáférés",
           "Valós idejű adatfolyamok",
-          "1 000 kérés/nap",
+          "60 kérés/perc",
+          "1 000 kérés/nap benne foglalt",
           "Webhook-értesítések",
           "Egyedi adatexportok"
         ]

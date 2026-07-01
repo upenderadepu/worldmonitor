@@ -27,10 +27,11 @@ import { getCachedCountryScore, normalizeCiiCountryCode } from '@/services/cache
 import { dataFreshness } from '@/services/data-freshness';
 import { fetchCountryMarkets } from '@/services/prediction';
 import { collectStoryData } from '@/services/story-data';
-// renderStoryToCanvas is dynamic-imported at its call site (#4486) so story-renderer
-// stays off the eager boot graph; this is one of its two eager edges (the other is
-// StoryModal). The export runs on user interaction (post-paint), already async.
-import { openStoryModal } from '@/components/StoryModal';
+// StoryModal is lazy-imported at its call site (below), and its render path
+// lazy-imports story-renderer, so both stay off the eager boot graph.
+// renderStoryToCanvas was already made dynamic in #4486; #4571 closes the
+// remaining StoryModal eager edge. The modal opens on user interaction
+// (post-paint), so the import() latency is hidden.
 
 import { hasPremiumAccess } from '@/services/panel-gating';
 import { getAuthState, subscribeAuthState } from '@/services/auth-state';
@@ -1512,6 +1513,9 @@ export class CountryIntelManager implements AppModule {
       regionalDescriptions: regional.map(r => r.description),
     } : null;
     const data = collectStoryData(code, name, this.ctx.latestClusters, postures, this.ctx.latestPredictions, signals, convergence);
+    // await (not void) so a chunk-load failure rejects openCountryStory's promise and
+    // reaches the caller's existing .catch() toast handler (country-intel.ts:205).
+    const { openStoryModal } = await import('@/components/StoryModal');
     openStoryModal(data);
   }
 

@@ -17,7 +17,7 @@ import { getCachedJson, setCachedJson } from './redis';
 // Types
 // ---------------------------------------------------------------------------
 
-interface CachedEntitlements {
+export interface CachedEntitlements {
   planKey: string;
   features: {
     tier: number;
@@ -45,6 +45,11 @@ interface CachedEntitlements {
     apiDailyAllowance?: number;
   };
   validUntil: number;
+}
+
+export interface EntitlementCheckResult {
+  response: Response | null;
+  entitlements: CachedEntitlements | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -174,6 +179,7 @@ async function _getEntitlementsImpl(userId: string): Promise<CachedEntitlements 
         'x-convex-shared-secret': convexSharedSecret,
       },
       body: JSON.stringify({ userId }),
+      signal: AbortSignal.timeout(3_000),
     });
     if (!response.ok) return null;
     const result = await response.json() as CachedEntitlements | null;
@@ -220,44 +226,67 @@ export async function checkEntitlement(
   pathname: string,
   corsHeaders: Record<string, string>,
 ): Promise<Response | null> {
+  const result = await checkEntitlementDetailed(userId, pathname, corsHeaders);
+  return result.response;
+}
+
+/**
+ * Same authorization decision as checkEntitlement(), plus the resolved
+ * entitlement row when one was available. Gateway telemetry uses this so
+ * allow/deny events reflect the exact plan/tier that drove the decision.
+ */
+export async function checkEntitlementDetailed(
+  userId: string | null,
+  pathname: string,
+  corsHeaders: Record<string, string>,
+): Promise<EntitlementCheckResult> {
   const requiredTier = getRequiredTier(pathname);
   if (requiredTier === null) {
     // Unrestricted endpoint -- no check needed
-    return null;
+    return { response: null, entitlements: null };
   }
 
   if (!userId) {
-    return new Response(
-      JSON.stringify({ error: 'Authentication required', requiredTier }),
-      { status: 403, headers: { 'Content-Type': 'application/json', ...corsHeaders } },
-    );
+    return {
+      response: new Response(
+        JSON.stringify({ error: 'Authentication required', requiredTier }),
+        { status: 403, headers: { 'Content-Type': 'application/json', ...corsHeaders } },
+      ),
+      entitlements: null,
+    };
   }
 
   const ent = await getEntitlements(userId);
   if (!ent) {
     // Fail-closed: unable to verify entitlements -> block the request
-    return new Response(
-      JSON.stringify({ error: 'Unable to verify entitlements', requiredTier }),
-      { status: 403, headers: { 'Content-Type': 'application/json', ...corsHeaders } },
-    );
+    return {
+      response: new Response(
+        JSON.stringify({ error: 'Unable to verify entitlements', requiredTier }),
+        { status: 403, headers: { 'Content-Type': 'application/json', ...corsHeaders } },
+      ),
+      entitlements: null,
+    };
   }
 
   if (ent.features.tier >= requiredTier) {
     // User has sufficient tier -- allow
-    return null;
+    return { response: null, entitlements: ent };
   }
 
   // User lacks required tier -- return 403
-  return new Response(
-    JSON.stringify({
-      error: 'Upgrade required',
-      requiredTier,
-      currentTier: ent.features.tier,
-      planKey: ent.planKey,
-    }),
-    {
-      status: 403,
-      headers: { 'Content-Type': 'application/json', ...corsHeaders },
-    },
-  );
+  return {
+    response: new Response(
+      JSON.stringify({
+        error: 'Upgrade required',
+        requiredTier,
+        currentTier: ent.features.tier,
+        planKey: ent.planKey,
+      }),
+      {
+        status: 403,
+        headers: { 'Content-Type': 'application/json', ...corsHeaders },
+      },
+    ),
+    entitlements: ent,
+  };
 }

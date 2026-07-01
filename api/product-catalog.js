@@ -53,13 +53,13 @@ const TIER_CONFIG = {
   pro: {
     name: 'Pro',
     description: 'Full intelligence dashboard',
-    features: ['Everything in Free', 'AI stock analysis & backtesting', 'Daily market briefs', 'Military & geopolitical tracking', 'Custom widget builder', 'MCP data connectors', 'Priority data refresh'],
+    features: ['Everything in Free', 'AI stock analysis & backtesting', 'Daily market briefs', 'Military & geopolitical tracking', 'Custom widget builder', 'MCP access for Claude Desktop & other AI clients (50 calls/day)', 'Priority data refresh'],
     highlighted: true,
   },
   api_starter: {
     name: 'API',
     description: 'Programmatic access to intelligence data',
-    features: ['REST API access', 'Real-time data streams', '1,000 requests/day', 'Webhook notifications', 'Custom data exports'],
+    features: ['REST API access', 'Real-time data streams', '60 requests/minute', '1,000 requests/day included', 'Webhook notifications', 'Custom data exports'],
     highlighted: false,
   },
   enterprise: {

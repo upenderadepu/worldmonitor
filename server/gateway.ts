@@ -18,7 +18,7 @@ import { captureSilentError } from '../api/_sentry-edge.js';
 import { mapErrorToResponse } from './error-mapper';
 import { checkRateLimit, checkEndpointRateLimit, hasEndpointRatePolicy } from './_shared/rate-limit';
 import { drainResponseHeaders } from './_shared/response-headers';
-import { checkEntitlement, getRequiredTier, getEntitlements } from './_shared/entitlement-check';
+import { checkEntitlementDetailed, getRequiredTier, getEntitlements, type CachedEntitlements } from './_shared/entitlement-check';
 import { resolveClerkSession } from './_shared/auth-session';
 import {
   INTERNAL_MCP_SIG_HEADER,
@@ -522,7 +522,13 @@ export function createDomainGateway(
       clerkOrgId: null,
       userApiKeyCustomerRef: null,
       tier: null,
+      planKey: null,
     };
+    function recordUsageEntitlement(ent: CachedEntitlements | null): void {
+      if (!ent) return;
+      usage.tier = typeof ent.features.tier === 'number' ? ent.features.tier : 0;
+      usage.planKey = ent.planKey;
+    }
     // Domain segment for telemetry. Path layouts:
     //   /api/<domain>/v1/<rpc>          → parts[2] = domain
     //   /api/v2/<domain>/<rpc>          → parts[2] = "v2", parts[3] = domain
@@ -560,6 +566,7 @@ export function createDomainGateway(
             principalId: identity.principal_id,
             authKind: identity.auth_kind,
             tier: identity.tier,
+            planKey: identity.plan_key,
             country: deriveCountry(originalRequest),
             ipCity: deriveIpCity(originalRequest),
             ipRegion: deriveIpRegion(originalRequest),
@@ -850,9 +857,7 @@ export function createDomainGateway(
       if (bodyBytes !== null) rebuildInit.body = bodyBytes;
       request = new Request(request.url, rebuildInit);
       usage.sessionUserId = verified.userId;
-      if (typeof ent.features.tier === 'number') {
-        usage.tier = ent.features.tier;
-      }
+      recordUsageEntitlement(ent);
       internalMcpVerified = true;
     }
 
@@ -897,16 +902,13 @@ export function createDomainGateway(
           forceKey: (isTierGated && !sessionUserId) || needsLegacyProBearerGate,
         })) as { valid: boolean; required: boolean; error?: string; kind?: 'enterprise' | 'session' | 'user' });
 
-    // Clerk session is itself proof of authentication (validated at line 410).
-    // validateApiKey is strict-no-trust-of-headers per #3541 and would 401 every
-    // Clerk-authenticated user who hasn't also minted a wms_ session token.
-    // Override: tier-gated routes with a resolved sessionUserId pass this layer.
-    if (isTierGated && sessionUserId && keyCheck.required && !keyCheck.valid) {
-      keyCheck = { valid: true, required: false };
-    }
-
     // User-owned API keys (wm_ prefix): when the static WORLDMONITOR_VALID_KEYS
     // check fails, try async Convex-backed validation for user-issued keys.
+    //
+    // Run this before the Clerk-session override below. A request can carry both
+    // a valid bearer session and an X-Api-Key wm_ header; when that happens, the
+    // wm_ key is still an explicit authenticating credential and its owner must
+    // pass the #4611 apiAccess gate.
     let isUserApiKey = false;
     const wmKey =
       request.headers.get('X-WorldMonitor-Key') ??
@@ -925,12 +927,19 @@ export function createDomainGateway(
         // userId argument directly (see checkEntitlement(sessionUserId, …))
         // so it no longer depends on this header — the header is now for
         // handler consumption + the internal-MCP `isCallerPremium` path.
-        if (!sessionUserId) {
-          sessionUserId = userKeyResult.userId;
-          usage.sessionUserId = sessionUserId;
-          request = withAuthenticatedUserId(request, sessionUserId);
-        }
+        sessionUserId = userKeyResult.userId;
+        usage.sessionUserId = sessionUserId;
+        usage.clerkOrgId = null;
+        request = withAuthenticatedUserId(request, sessionUserId);
       }
+    }
+
+    // Clerk session is itself proof of authentication (validated at line 410).
+    // validateApiKey is strict-no-trust-of-headers per #3541 and would 401 every
+    // Clerk-authenticated user who hasn't also minted a wms_ session token.
+    // Override: tier-gated routes with a resolved sessionUserId pass this layer.
+    if (isTierGated && sessionUserId && keyCheck.required && !keyCheck.valid) {
+      keyCheck = { valid: true, required: false };
     }
 
     // Enterprise API key (WORLDMONITOR_VALID_KEYS): require kind === 'enterprise'.
@@ -942,14 +951,51 @@ export function createDomainGateway(
       usage.enterpriseApiKey = wmKey;
     }
 
-    // User API keys on PREMIUM_RPC_PATHS need verified pro-tier entitlement.
-    // Admin keys (WORLDMONITOR_VALID_KEYS) bypass this since they are operator-issued.
-    if (isUserApiKey && needsLegacyProBearerGate && sessionUserId) {
-      const ent = await getEntitlements(sessionUserId);
-      if (ent) usage.tier = typeof ent.features.tier === 'number' ? ent.features.tier : 0;
-      if (!ent || !ent.features.apiAccess) {
+    // ── Active-subscription gate for user API keys (#4611) ──────────────────
+    // A wm_ user key that authenticated this request must map to an owner with
+    // ACTIVE apiAccess on EVERY keyed route — not just PREMIUM_RPC_PATHS. A
+    // cancelled/downgraded customer keeps a valid (un-revoked) key that still
+    // resolves to their userId, so without a route-wide gate the key keeps
+    // serving the whole paid programmatic surface for free: the API Starter
+    // product leaks past churn. Runs BEFORE the #3199 per-account rate-limit
+    // block so an expired key is rejected outright, never metered — and the
+    // resolved entitlement is reused there to avoid a second lookup.
+    //
+    // Scoped to isUserApiKey: the wm_ key IS the authenticating credential
+    // (isUserApiKey ⇒ sessionUserId is the resolved key owner, set above).
+    // This intentionally does NOT re-validate wm_ keys on any other route class:
+    //   - Enterprise operator keys (kind 'enterprise', incl. legacy wm_-prefixed
+    //     relay keys) never set isUserApiKey and carry no user entitlement row.
+    //   - Verified internal paths (MCP / seed-refresh / relay warm-ping) never
+    //     set isUserApiKey.
+    //   - PUBLIC_NO_AUTH_RPC_PATHS serve free data to everyone; the key is not
+    //     the authenticator there. Re-validating an arbitrary header key on that
+    //     anonymous surface would add an unauthenticated Convex-lookup
+    //     amplification vector (a rotating fake wm_ key per request defeats the
+    //     negative cache, ahead of any rate limit) for no revenue gain — public
+    //     data is not the paid product — and would wrongly gate the
+    //     intentionally-anonymous lead-capture forms.
+    let userKeyEntitlement: CachedEntitlements | null | undefined;
+    if (isUserApiKey && sessionUserId) {
+      userKeyEntitlement = await getEntitlements(sessionUserId);
+      recordUsageEntitlement(userKeyEntitlement);
+      // Fail-OPEN on an unresolved entitlement (null ⇒ transient Convex/cache
+      // failure, indistinguishable from "no row"): mirrors the #3199 block below
+      // and avoids 403-ing an ACTIVE subscriber fleet-wide during a backend
+      // blip. Reject only on an AFFIRMATIVELY inactive/expired entitlement — the
+      // systematic churn case (#4611), always resolvable under normal operation
+      // (the warm 15-min entitlement cache closes the leak; an outage degrades
+      // to prior behavior rather than denying paying customers).
+      if (
+        userKeyEntitlement &&
+        (!userKeyEntitlement.features.apiAccess || userKeyEntitlement.validUntil < Date.now())
+      ) {
         emitRequest(403, 'tier_403', null);
-        return createGatewayAuthErrorResponse(403, 'API access subscription required', corsHeaders);
+        return createGatewayAuthErrorResponse(
+          403,
+          'API access requires an active subscription',
+          corsHeaders,
+        );
       }
     }
 
@@ -990,7 +1036,7 @@ export function createDomainGateway(
           let allowed = session.role === 'pro';
           if (!allowed && session.userId) {
             const ent = await getEntitlements(session.userId);
-            if (ent) usage.tier = typeof ent.features.tier === 'number' ? ent.features.tier : 0;
+            recordUsageEntitlement(ent);
             allowed = !!ent && ent.features.tier >= 1 && ent.validUntil >= Date.now();
           }
           if (!allowed) {
@@ -1020,7 +1066,9 @@ export function createDomainGateway(
     // through the MCP edge's whitelisted tool set.
     const isEnterpriseAuth = keyCheck.valid && wmKey && !isUserApiKey && keyCheck.kind === 'enterprise';
     if (!isEnterpriseAuth && !internalMcpVerified && !seedRefreshVerified && !relayWarmPingVerified) {
-      const entitlementResponse = await checkEntitlement(sessionUserId, pathname, corsHeaders);
+      const entitlementCheck = await checkEntitlementDetailed(sessionUserId, pathname, corsHeaders);
+      recordUsageEntitlement(entitlementCheck.entitlements);
+      const entitlementResponse = entitlementCheck.response;
       if (entitlementResponse) {
         const entReason: RequestReason =
           entitlementResponse.status === 401 ? 'auth_401'
@@ -1030,13 +1078,6 @@ export function createDomainGateway(
         return entitlementResponse.status === 401 || entitlementResponse.status === 403
           ? markAuthErrorNoStore(entitlementResponse)
           : entitlementResponse;
-      }
-      // Allowed → record the resolved tier for telemetry. getEntitlements has
-      // its own Redis cache + in-flight coalescing, so the second lookup here
-      // does not double the cost when checkEntitlement already fetched.
-      if (isTierGated && sessionUserId && usage.tier === null) {
-        const ent = await getEntitlements(sessionUserId);
-        if (ent) usage.tier = typeof ent.features.tier === 'number' ? ent.features.tier : 0;
       }
     }
 
@@ -1077,6 +1118,8 @@ export function createDomainGateway(
         if (isEnterpriseAuth) {
           perMinute = ENTERPRISE_API_RATE_LIMIT; // hardcoded — no entitlement row
           allowance = -1; // unlimited daily / no ceiling
+          usage.tier = 3; // enterprise tier — no entitlement row to read it from
+          // (plan_key defaults to 'enterprise' in buildUsageIdentity)
           // Enterprise burst is keyed PER KEY (not per account) by design:
           // these are operator-issued WORLDMONITOR_VALID_KEYS with no shared
           // userId, and unlimited daily — so there's no quota to multiply by
@@ -1085,7 +1128,20 @@ export function createDomainGateway(
           // on userId so a customer can't multiply their allowance.)
           identity = wmKey ? hashKeySync(wmKey) : '';
         } else if (sessionUserId) {
-          const ent = await getEntitlements(sessionUserId);
+          // Reuse the entitlement the #4611 gate above already resolved for this
+          // same user key (undefined ⇒ the gate didn't run, e.g. a Clerk-session
+          // caller with no wm_ key — resolve it now). Avoids a duplicate lookup
+          // on the hot active-key path.
+          const ent =
+            userKeyEntitlement !== undefined
+              ? userKeyEntitlement
+              : await getEntitlements(sessionUserId);
+          if (ent) {
+            // #4572 — attribute the usage event to the caller's real tier +
+            // plan (recorded even for downgraded keys), so the limit-abuse
+            // audit can compare each request to the customer's actual cap.
+            recordUsageEntitlement(ent);
+          }
           if (ent && ent.features.apiAccess && ent.features.apiRateLimit > 0) {
             perMinute = ent.features.apiRateLimit;
             // undefined ⇒ fail-open (no daily limit); -1 ⇒ unlimited.
